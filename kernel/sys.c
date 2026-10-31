@@ -2962,3 +2962,80 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
 	return 0;
 }
 #endif /* CONFIG_COMPAT */
+
+SYSCALL_DEFINE1(my_get_physical_addresses, void __user *, uaddr)
+{
+	struct mm_struct *mm = current->mm;
+	unsigned long addr = (unsigned long)uaddr;
+	unsigned long pfn;
+	phys_addr_t pa = 0;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	spinlock_t *ptl;
+	pud_t pudval;
+	pmd_t pmdval;
+	if (!mm)
+		return 0;
+	if (addr >= TASK_SIZE)
+		return 0;
+	if (mmap_read_lock_killable(mm))
+		return 0;
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		goto out;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		goto out;
+	pud = pud_offset(p4d, addr);
+	pudval = READ_ONCE(*pud);
+	if (pud_none(pudval))
+		goto out;
+	if (pud_leaf(pudval)) {
+		if (pud_present(pudval)) {
+			pfn = pud_pfn(pudval);
+			if (pfn_valid(pfn))
+				pa = PFN_PHYS(pfn) + (addr & ~PUD_MASK);
+		}
+		goto out;
+	}
+	if (pud_bad(pudval))
+		goto out;
+	pmd = pmd_offset(pud, addr);
+	pmdval = READ_ONCE(*pmd);
+	if (pmd_none(pmdval))
+		goto out;
+	if (pmd_leaf(pmdval)) {
+		ptl = pmd_lock(mm, pmd);
+		pmdval = READ_ONCE(*pmd);
+		if (pmd_present(pmdval) && pmd_leaf(pmdval)) {
+			pfn = pmd_pfn(pmdval);
+			if (pfn_valid(pfn))
+				pa = PFN_PHYS(pfn) + (addr & ~PMD_MASK);
+			spin_unlock(ptl);
+			goto out;
+		}
+		spin_unlock(ptl);
+		/*
+		* The huge PMD was split while we waited for the lock.
+		* Re-read and fall through to the PTE path.
+		*/
+		pmdval = READ_ONCE(*pmd);
+	}
+	if (pmd_bad(pmdval))
+		goto out;
+	pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!pte)
+		goto out;
+	if (pte_present(*pte)) {
+		pfn = pte_pfn(*pte);
+		if (pfn_valid(pfn))
+			pa = PFN_PHYS(pfn) + (addr & ~PAGE_MASK);
+	}
+	pte_unmap_unlock(pte, ptl);
+out:
+	mmap_read_unlock(mm);
+	return (long)pa;
+}
