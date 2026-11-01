@@ -2963,6 +2963,18 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
 }
 #endif /* CONFIG_COMPAT */
 
+/*
+ * my_get_physical_addresses - 查詢使用者虛擬位址對應的實體位址
+ *
+ * @uaddr: 使用者空間的虛擬位址 (syscall 第一個參數)
+ *
+ * 沿著 current 的頁表 (PGD -> P4D -> PUD -> PMD -> PTE) 逐層往下走，
+ * 找到涵蓋 addr 的 leaf entry (可能是 PUD/PMD 的大頁，或最後一層 PTE)，
+ * 由其中的 PFN 換算出實體位址後回傳。
+ *
+ * 回傳值：對應的實體位址；位址未映射、超出使用者空間或查表失敗時回傳 0。
+ * (因此呼叫端無法區分「實體位址剛好是 0」與「查詢失敗」。)
+ */
 SYSCALL_DEFINE1(my_get_physical_addresses, void __user *, uaddr)
 {
 	struct mm_struct *mm = current->mm;
@@ -2977,37 +2989,52 @@ SYSCALL_DEFINE1(my_get_physical_addresses, void __user *, uaddr)
 	spinlock_t *ptl;
 	pud_t pudval;
 	pmd_t pmdval;
+
+	/* 沒有 mm 表示是 kernel thread，不會有使用者位址空間 */
 	if (!mm)
 		return 0;
+	/* 只接受使用者空間位址，避免使用者藉此窺探 kernel 映射 */
 	if (addr >= TASK_SIZE)
 		return 0;
+	/* 持有 mmap_lock (reader) 才不會在走頁表途中被 unmap/mremap 破壞 */
 	if (mmap_read_lock_killable(mm))
 		return 0;
+
+	/* 第一層：PGD，尚未配置則代表此位址沒有映射 */
 	pgd = pgd_offset(mm, addr);
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		goto out;
+	/* 第二層：P4D (5-level page table 時才會真的分層) */
 	p4d = p4d_offset(pgd, addr);
 	if (p4d_none(*p4d) || p4d_bad(*p4d))
 		goto out;
+
+	/* 第三層：PUD。先讀一次快照，後面所有判斷都基於這個值 */
 	pud = pud_offset(p4d, addr);
 	pudval = READ_ONCE(*pud);
 	if (pud_none(pudval))
 		goto out;
+	/* PUD 可能是 gigantic page (例如 1GB huge page)，直接就是 leaf */
 	if (pud_leaf(pudval)) {
 		if (pud_present(pudval)) {
 			pfn = pud_pfn(pudval);
 			if (pfn_valid(pfn))
+				/* 大頁內位移量 = addr 在 PUD 覆蓋範圍內的 offset */
 				pa = PFN_PHYS(pfn) + (addr & ~PUD_MASK);
 		}
 		goto out;
 	}
 	if (pud_bad(pudval))
 		goto out;
+
+	/* 第四層：PMD，作法同 PUD */
 	pmd = pmd_offset(pud, addr);
 	pmdval = READ_ONCE(*pmd);
 	if (pmd_none(pmdval))
 		goto out;
+	/* PMD 也可能是 huge page (例如 THP、2MB huge page) */
 	if (pmd_leaf(pmdval)) {
+		/* 與 THP 的 split 競爭：需在 pmd lock 下重新確認仍是 leaf */
 		ptl = pmd_lock(mm, pmd);
 		pmdval = READ_ONCE(*pmd);
 		if (pmd_present(pmdval) && pmd_leaf(pmdval)) {
@@ -3019,23 +3046,28 @@ SYSCALL_DEFINE1(my_get_physical_addresses, void __user *, uaddr)
 		}
 		spin_unlock(ptl);
 		/*
-		* The huge PMD was split while we waited for the lock.
-		* Re-read and fall through to the PTE path.
-		*/
+		 * 等待鎖的期間這個 huge PMD 已被 split 掉了，
+		 * 重新讀取後改走下面的 PTE 路徑。
+		 */
 		pmdval = READ_ONCE(*pmd);
 	}
 	if (pmd_bad(pmdval))
 		goto out;
+
+	/* 第五層：PTE，一般 4KB page 走這條路徑 */
 	pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
 	if (!pte)
 		goto out;
 	if (pte_present(*pte)) {
 		pfn = pte_pfn(*pte);
 		if (pfn_valid(pfn))
+			/* 頁內位移量 = addr 在 page frame 內的 offset */
 			pa = PFN_PHYS(pfn) + (addr & ~PAGE_MASK);
 	}
 	pte_unmap_unlock(pte, ptl);
+
 out:
 	mmap_read_unlock(mm);
+	/* 錯誤與未映射都回傳 0，成功時回傳實體位址 */
 	return (long)pa;
 }
