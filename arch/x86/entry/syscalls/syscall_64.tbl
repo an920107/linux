@@ -432,4 +432,6 @@
 # This is the end of the legacy x32 range.  Numbers 548 and above are
 # not special and are not to be used for x32-specific syscalls.
 
+# 自訂系統呼叫 (nr=548, ABI=64 僅限 x86_64 原生 64-bit)，
+# 進入點對應 kernel/sys.c 中的 SYSCALL_DEFINE1(my_get_physical_addresses, ...)
 548 64 my_get_physical_addresses sys_my_get_physical_addresses

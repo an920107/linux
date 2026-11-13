@@ -2968,106 +2968,184 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
  *
  * @uaddr: 使用者空間的虛擬位址 (syscall 第一個參數)
  *
- * 沿著 current 的頁表 (PGD -> P4D -> PUD -> PMD -> PTE) 逐層往下走，
- * 找到涵蓋 addr 的 leaf entry (可能是 PUD/PMD 的大頁，或最後一層 PTE)，
- * 由其中的 PFN 換算出實體位址後回傳。
+ * 實作流程與同步機制：
+ * 1. 先檢查 current->mm 是否存在以及 uaddr 是否落在合法使用者空間 (< TASK_SIZE)。
+ * 2. 取得 mm->mmap_lock 的 read lock (killable)，確保走頁表期間 VMA 與上層頁表
+ *    不會被並行的 munmap / mremap / exit_mmap 釋放。
+ * 3. 沿著 current->mm 的五層頁表結構 (PGD -> P4D -> PUD -> PMD -> PTE) 逐層往下走，
+ *    並以 READ_ONCE() 取得頁表項目快照，避免無鎖讀取時產生重讀或撕裂讀：
+ *    - 若在 PUD 層遇到 leaf (例如 1GB gigantic huge page)，直接計算實體位址。
+ *    - 若在 PMD 層遇到 leaf (例如 2MB huge page / THP)，需取得 pmd_lock() 後
+ *      重新確認其仍為 present leaf，以防範與並行的 THP split 發生競爭；若等鎖
+ *      期間已被 split，則重新讀取 PMD 後改走下層 PTE 路徑。
+ *    - 若走到 PTE 層，使用 pte_offset_map_lock() 映射並鎖定 PTE 頁表後，檢查
+ *      pte_present() 與 pfn_valid()，最後加上頁內位移量算出實體位址。
  *
- * 回傳值：對應的實體位址；位址未映射、超出使用者空間或查表失敗時回傳 0。
- * (因此呼叫端無法區分「實體位址剛好是 0」與「查詢失敗」。)
+ * 回傳值：
+ *   成功時回傳對應的實體位址 (以 long 回傳)；
+ *   若為 kernel thread、位址超出使用者空間、等鎖時被 SIGKILL 中斷、位址未映射、
+ *   頁面目前不在實體記憶體中 (例如尚未 fault-in 或已換出至 swap)，或 PFN 無效，
+ *   則一律回傳 0。(註：因此呼叫端無法區分「實體位址恰好為 0」與「查詢失敗」。)
  */
 SYSCALL_DEFINE1(my_get_physical_addresses, void __user *, uaddr)
 {
+	/* 目前行程的記憶體描述子（含頁表根指標 mm->pgd 與 mmap_lock）；kernel thread 為 NULL */
 	struct mm_struct *mm = current->mm;
+	/* 將使用者指標轉為整數虛擬位址，供邊界檢查、頁表查表與位移遮罩運算使用 */
 	unsigned long addr = (unsigned long)uaddr;
+	/* Page Frame Number（實體頁框編號），由命中的 leaf entry (PUD/PMD/PTE) 擷取 */
 	unsigned long pfn;
+	/* 最終換算得到的實體位址；預設為 0，代表未映射或查詢失敗 */
 	phys_addr_t pa = 0;
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
+	/* 各層頁表中對應 addr 索引的項目指標（由上而下：PGD -> P4D -> PUD -> PMD -> PTE） */
+	pgd_t *pgd;	/* 第 1 層：Page Global Directory 項目指標 */
+	p4d_t *p4d;	/* 第 2 層：Page 4th Directory 項目指標（4-level paging 時會被摺疊） */
+	pud_t *pud;	/* 第 3 層：Page Upper Directory 項目指標 */
+	pmd_t *pmd;	/* 第 4 層：Page Middle Directory 項目指標 */
+	pte_t *pte;	/* 第 5 層：Page Table Entry 項目指標（經 pte_offset_map_lock 暫時映射） */
+	/* Page Table Lock 指標，接收 pmd_lock() 或 pte_offset_map_lock() 所取得之 spinlock */
 	spinlock_t *ptl;
+	/*
+	 * 以 READ_ONCE() 讀取的頁表項目快照值，確保後續判斷與 PFN 解析皆基於
+	 * 同一份數值（避免無鎖讀取時因編譯器重讀造成不一致，並用於偵測 THP split）。
+	 */
 	pud_t pudval;
 	pmd_t pmdval;
 
-	/* 沒有 mm 表示是 kernel thread，不會有使用者位址空間 */
+	/*
+	 * 沒有 mm 表示目前處於 kernel thread 上下文（借用 active_mm），
+	 * 不具備獨立的使用者空間頁表，直接回傳 0。
+	 */
 	if (!mm)
 		return 0;
-	/* 只接受使用者空間位址，避免使用者藉此窺探 kernel 映射 */
+
+	/*
+	 * 邊界檢查：只允許查詢使用者空間位址 [0, TASK_SIZE)，
+	 * 避免使用者行程藉由傳入核心空間位址來探測 kernel 頁表映射。
+	 */
 	if (addr >= TASK_SIZE)
 		return 0;
-	/* 持有 mmap_lock (reader) 才不會在走頁表途中被 unmap/mremap 破壞 */
+
+	/*
+	 * 以 reader 身分持有 mm->mmap_lock，防止走頁表過程中發生 munmap()、
+	 * mremap() 等改寫 VMA 與釋放上層頁表的操作。使用 killable 版本讓
+	 * 等鎖中的行程若收到 SIGKILL 可即時中止（此處統一回傳 0）。
+	 */
 	if (mmap_read_lock_killable(mm))
 		return 0;
 
-	/* 第一層：PGD，尚未配置則代表此位址沒有映射 */
+	/*
+	 * 第一層：PGD (Page Global Directory)
+	 * 由 mm->pgd 依 addr 最高位索引取得對應項目；若為 none 代表下層未配置，
+	 * 若為 bad 代表旗標異常，皆視為無有效映射。
+	 */
 	pgd = pgd_offset(mm, addr);
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		goto out;
-	/* 第二層：P4D (5-level page table 時才會真的分層) */
+
+	/*
+	 * 第二層：P4D (Page 4th Directory)
+	 * 在啟用 5-level paging (如 x86_64 LA57) 時實際查表；若為 4-level paging，
+	 * 核心會將此層摺疊 (fold) 為直通 PGD 的無操作包裝，不產生額外記憶體存取。
+	 */
 	p4d = p4d_offset(pgd, addr);
 	if (p4d_none(*p4d) || p4d_bad(*p4d))
 		goto out;
 
-	/* 第三層：PUD。先讀一次快照，後面所有判斷都基於這個值 */
+	/*
+	 * 第三層：PUD (Page Upper Directory)
+	 * 僅持 mmap_read_lock 時可能有並行更新，先以 READ_ONCE() 取得單次快照，
+	 * 確保後續所有檢查與 PFN 解析都基於同一個一致的值，避免編譯器重讀。
+	 */
 	pud = pud_offset(p4d, addr);
 	pudval = READ_ONCE(*pud);
 	if (pud_none(pudval))
 		goto out;
-	/* PUD 可能是 gigantic page (例如 1GB huge page)，直接就是 leaf */
+
+	/*
+	 * 檢查 PUD 是否為 leaf entry（例如 1GB gigantic huge page）：
+	 * leaf 代表此項目直接指向實體大頁而不指向下層 PMD。
+	 */
 	if (pud_leaf(pudval)) {
+		/* 確認頁面確實存在於實體記憶體（非 swap/migration 等特殊項目） */
 		if (pud_present(pudval)) {
 			pfn = pud_pfn(pudval);
+			/* 確認 PFN 落在核心管理的有效實體記憶體區段內 */
 			if (pfn_valid(pfn))
-				/* 大頁內位移量 = addr 在 PUD 覆蓋範圍內的 offset */
+				/* 實體位址 = 大頁起始位址 + addr 在 PUD 範圍內的低位位移量 */
 				pa = PFN_PHYS(pfn) + (addr & ~PUD_MASK);
 		}
 		goto out;
 	}
+	/* 非 leaf 時須符合頁目錄規範，否則視為異常並中止 */
 	if (pud_bad(pudval))
 		goto out;
 
-	/* 第四層：PMD，作法同 PUD */
+	/*
+	 * 第四層：PMD (Page Middle Directory)
+	 * 同樣先讀取單次快照，再判斷是否為空、huge page leaf 或下層 PTE 目錄。
+	 */
 	pmd = pmd_offset(pud, addr);
 	pmdval = READ_ONCE(*pmd);
 	if (pmd_none(pmdval))
 		goto out;
-	/* PMD 也可能是 huge page (例如 THP、2MB huge page) */
+
+	/*
+	 * PMD 可能是 2MB huge page（如 Transparent Huge Page 或 hugetlbfs）。
+	 * 注意：即使持有 mmap_read_lock，THP 仍可能被其他執行緒平行 split 成
+	 * 512 個 4KB PTE，因此不能僅靠無鎖快照就直接取值。
+	 */
 	if (pmd_leaf(pmdval)) {
-		/* 與 THP 的 split 競爭：需在 pmd lock 下重新確認仍是 leaf */
+		/* 取得保護此 PMD 的 spinlock（依設定為 split PMD lock 或 page_table_lock） */
 		ptl = pmd_lock(mm, pmd);
+		/* 上鎖後重新讀取，確認在等鎖期間這個 huge PMD 沒有被 split 或 unmap */
 		pmdval = READ_ONCE(*pmd);
 		if (pmd_present(pmdval) && pmd_leaf(pmdval)) {
 			pfn = pmd_pfn(pmdval);
 			if (pfn_valid(pfn))
+				/* 實體位址 = 2MB 大頁起始位址 + addr 在 PMD 範圍內的位移量 */
 				pa = PFN_PHYS(pfn) + (addr & ~PMD_MASK);
 			spin_unlock(ptl);
 			goto out;
 		}
 		spin_unlock(ptl);
 		/*
-		 * 等待鎖的期間這個 huge PMD 已被 split 掉了，
-		 * 重新讀取後改走下面的 PTE 路徑。
+		 * 等待鎖的期間這個 huge PMD 已被 split 掉了（或已變更），
+		 * 重新讀取目前的 PMD 值後，改走下面的一般 PTE 路徑。
 		 */
 		pmdval = READ_ONCE(*pmd);
 	}
+	/* 確保此時 PMD 指向有效的下層 PTE 頁表 */
 	if (pmd_bad(pmdval))
 		goto out;
 
-	/* 第五層：PTE，一般 4KB page 走這條路徑 */
+	/*
+	 * 第五層：PTE (Page Table Entry)，處理一般 4KB page。
+	 * pte_offset_map_lock() 會建立 PTE 頁表的暫時映射（必要時 kmap）並鎖定
+	 * 對應的 PTE spinlock，同時在鎖內重新確認 *pmd 未被置換或移除；
+	 * 若期間 PTE 頁表已不存在（例如被清除或轉為 THP），會回傳 NULL。
+	 */
 	pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
 	if (!pte)
 		goto out;
+
+	/*
+	 * 只有 pte_present() 為真才代表頁面目前駐留於實體 RAM 中
+	 * （可排除尚未觸發 page fault 的 none、swap entry、migration entry 等）。
+	 */
 	if (pte_present(*pte)) {
 		pfn = pte_pfn(*pte);
+		/* 驗證 PFN 有效，避免映射為特殊位址或超出已知 memmap 範圍 */
 		if (pfn_valid(pfn))
-			/* 頁內位移量 = addr 在 page frame 內的 offset */
+			/* 實體位址 = 頁框基底位址 + addr 在 4KB page 內的低 12-bit 位移量 */
 			pa = PFN_PHYS(pfn) + (addr & ~PAGE_MASK);
 	}
+	/* 成對釋放 PTE spinlock 並解除暫時映射 */
 	pte_unmap_unlock(pte, ptl);
 
 out:
+	/* 釋放 mmap_lock read lock，結束頁表走訪 */
 	mmap_read_unlock(mm);
-	/* 錯誤與未映射都回傳 0，成功時回傳實體位址 */
+	/* 將 phys_addr_t 轉型為 syscall 回傳型別 long；未映射或失敗時皆為 0 */
 	return (long)pa;
 }
